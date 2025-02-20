@@ -27,6 +27,9 @@ mkdir -p ./results
 # task args
 TASK_ARGS="--height 1024 --width 1024 --no_use_resolution_binning"
 
+# cache args
+# CACHE_ARGS="--use_teacache"
+# CACHE_ARGS="--use_fbcache"
 
 # On 8 gpus, pp=2, ulysses=2, ring=1, cfg_parallel=2 (split batch)
 N_GPUS=8
@@ -64,3 +67,4 @@ $CFG_ARGS \
 $PARALLLEL_VAE \
 $COMPILE_FLAG \
 $QUANTIZE_FLAG \
+$CACHE_ARGS \

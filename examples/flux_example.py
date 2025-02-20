@@ -11,6 +11,10 @@ from xfuser.core.distributed import (
     get_data_parallel_world_size,
     get_runtime_state,
     is_dp_last_group,
+    get_pipeline_parallel_world_size,
+    get_classifier_free_guidance_world_size,
+    get_tensor_model_parallel_world_size,
+    get_data_parallel_world_size,
 )
 
 
@@ -45,6 +49,24 @@ def main():
     parameter_peak_memory = torch.cuda.max_memory_allocated(device=f"cuda:{local_rank}")
 
     pipe.prepare_run(input_config, steps=1)
+    from xfuser.model_executor.plugins.teacache.diffusers_adapters import apply_teacache_on_transformer
+    from xfuser.model_executor.plugins.first_block_cache.diffusers_adapters import apply_fbcache_on_transformer
+    use_cache = engine_args.use_teacache or engine_args.use_fbcache
+    if (use_cache
+        and get_pipeline_parallel_world_size() == 1
+        and get_classifier_free_guidance_world_size() == 1
+        and get_tensor_model_parallel_world_size() == 1
+    ):
+        use_cache = True
+    if engine_args.use_fbcache and engine_args.use_teacache:
+        pipe.transformer = apply_fbcache_on_transformer(
+            pipe.transformer, rel_l1_thresh=0.6, use_cache=use_cache, return_hidden_states_first=False)
+    elif engine_args.use_teacache:
+        pipe.transformer = apply_teacache_on_transformer(
+            pipe.transformer, rel_l1_thresh=0.6, use_cache=use_cache, num_steps=input_config.num_inference_steps)
+    elif engine_args.use_fbcache:
+        pipe.transformer = apply_fbcache_on_transformer(
+            pipe.transformer, rel_l1_thresh=0.6, use_cache=use_cache, return_hidden_states_first=False)
 
     torch.cuda.reset_peak_memory_stats()
     start_time = time.time()
