@@ -21,6 +21,23 @@ from xfuser.core.distributed import (
 
 logger = init_logger(__name__)
 
+_input_cuda_stream = None
+_output_cuda_stream = None
+
+def get_input_cuda_stream():
+    global _input_cuda_stream
+    if _input_cuda_stream is None:
+        _input_cuda_stream = torch.cuda.Stream()
+        print("Input CUDA stream created")
+    return _input_cuda_stream
+
+def get_output_cuda_stream():
+    global _output_cuda_stream
+    if _output_cuda_stream is None:
+        _output_cuda_stream = torch.cuda.Stream()
+        print("Output CUDA stream created")
+    return _output_cuda_stream
+
 
 class xFuserLongContextAttention(LongContextAttention):
     ring_impl_type_supported_kv_cache = ["basic"]
@@ -78,8 +95,103 @@ class xFuserLongContextAttention(LongContextAttention):
         from xfuser.core.long_ctx_attention.ring import xdit_ring_flash_attn_func
         self.ring_attn_fn = xdit_ring_flash_attn_func
 
+        self.comp_stream = torch.cuda.default_stream()
+        self.input_comm_stream = get_input_cuda_stream()
+        self.output_comm_stream = get_output_cuda_stream()
+
     @torch.compiler.disable
     def forward(
+        self,
+        attn,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        *,
+        joint_tensor_query=None,
+        joint_tensor_key=None,
+        joint_tensor_value=None,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+        alibi_slopes=None,
+        deterministic=False,
+        return_attn_probs=False,
+        joint_strategy="none",
+    ) -> Tensor:
+
+        per_chunk_head = self.ulysses_pg.size()
+        num_heads = query.shape[2]
+        NUM_BUFFERS = num_heads // per_chunk_head
+
+        buffers_input = [{"comm_done": torch.cuda.Event(), "data": None, "in_use": False} for _ in range(NUM_BUFFERS)]
+        buffers_output = [{"comp_done": torch.cuda.Event(), "data": None, "in_use": False} for _ in range(NUM_BUFFERS)]
+
+        qkv = torch.cat([query, key, value]).contiguous()
+        split_qkv =  torch.split(qkv, per_chunk_head, dim=2)
+
+        for buf in buffers_output:
+            buf["comp_done"].record(stream=self.comp_stream)
+            buf["comp_done"].wait(stream=self.input_comm_stream)
+
+        with torch.cuda.stream(self.input_comm_stream):
+            for i in range(NUM_BUFFERS):
+                buffers_input[i]["data"] = SeqAllToAll4D.apply(
+                    self.ulysses_pg, split_qkv[i], self.scatter_idx, self.gather_idx
+                )
+                buffers_input[i]["comm_done"].record(stream=self.input_comm_stream)
+                buffers_input[i]['in_use'] = True
+
+        output_list = []
+        processed_count = 0
+
+        while processed_count < NUM_BUFFERS:
+            for i in range(NUM_BUFFERS):
+                if buffers_input[i]["in_use"]:
+                    with torch.cuda.stream(self.comp_stream):
+                        buffers_input[i]["comm_done"].wait(stream=self.comp_stream)
+                        qkv = torch.split(buffers_input[i]["data"], 1, dim=0)
+                        q, k, v = qkv
+                        context_layer = self.ring_attn_fn(
+                            q,
+                            k,
+                            v,
+                            dropout_p=dropout_p,
+                            softmax_scale=softmax_scale,
+                            causal=causal,
+                            window_size=window_size,
+                            alibi_slopes=alibi_slopes,
+                            deterministic=deterministic,
+                            return_attn_probs=return_attn_probs,
+                            group=self.ring_pg,
+                            attn_type=self.attn_type,
+                            attn_processor=self.attn_processor,
+                            attn_layer=attn if self.use_kv_cache else None,
+                            joint_tensor_key=joint_tensor_key,
+                            joint_tensor_value=joint_tensor_value,
+                            joint_strategy=joint_strategy,
+                        )
+                        buffers_output[i]["data"] = context_layer
+                        buffers_output[i]["comp_done"].record(stream=self.comp_stream)
+                        buffers_output[i]["in_use"] = True
+                        buffers_input[i]["in_use"] = False
+
+            for i in range(NUM_BUFFERS):
+                if buffers_output[i]["in_use"]:
+                    with torch.cuda.stream(self.output_comm_stream):
+                        buffers_output[i]["comp_done"].wait(stream=self.output_comm_stream)
+                        out = SeqAllToAll4D.apply(self.ulysses_pg, buffers_output[i]["data"], self.gather_idx, self.scatter_idx)
+                        comm_done_event = torch.cuda.Event()
+                        output_list.append(out)
+                        processed_count += 1
+                        buffers_output[i]["in_use"] = False
+
+        torch.cuda.synchronize()
+
+        return torch.cat(output_list, dim=2)
+
+    @torch.compiler.disable
+    def forward_(
         self,
         attn,
         query: Tensor,
